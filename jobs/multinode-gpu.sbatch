@@ -22,7 +22,7 @@ head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 port=$(( 29500 + SLURM_JOB_ID % 1000 ))
 echo "job $SLURM_JOB_ID  nodes=$SLURM_JOB_NODELIST  head=$head_node:$port"
 
-srun --kill-on-bad-exit=1 venv/bin/torchrun \
+srun --kill-on-bad-exit=1 .venv/bin/torchrun \
   --nnodes="$SLURM_NNODES" \
   --nproc_per_node="$GPUS_PER_NODE" \
   --rdzv_id="$SLURM_JOB_ID" \

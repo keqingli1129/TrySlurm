@@ -1,0 +1,20 @@
+[project]
+name = "slurm-lab"
+version = "0.1.0"
+description = "Slurm + torchrun DDP practice lab"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.5",
+    "torch",
+]
+
+# The RTX 50-series (sm_120) needs a CUDA 12.8+ build of torch. Only torch comes from this
+# index; everything else resolves from PyPI. A newer index (cu129, cu130, ...) also works if
+# the driver is new enough.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

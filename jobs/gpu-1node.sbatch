@@ -18,7 +18,7 @@ port=$(( 29500 + SLURM_JOB_ID % 1000 ))   # avoids clashes if two jobs share a n
 
 echo "job $SLURM_JOB_ID  nodes=$SLURM_JOB_NODELIST  head=$head_node:$port  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-srun venv/bin/torchrun \
+srun .venv/bin/torchrun \
   --nnodes="$SLURM_NNODES" \
   --nproc_per_node="$GPUS_PER_NODE" \
   --rdzv_id="$SLURM_JOB_ID" \

@@ -18,7 +18,8 @@ GPUs is a backend switch that `train.py` already handles.
 
 ```
 setup-host-slurm.sh        Part 1: installs and configures Slurm + munge (run with sudo)
-setup-python.sh            Part 1: venv with a Blackwell-capable PyTorch, then a GPU test
+pyproject.toml, uv.lock   Python deps managed by uv (torch from the cu128 index, pinned in uv.lock)
+setup-python.sh            Part 1: `uv sync` (.venv with a Blackwell-capable PyTorch), then a GPU test
 check_gpu.py               verifies torch can run kernels on the 5070
 train.py                   DDP training script (synthetic data, checkpoint/resume) used by every job
 jobs/gpu-1node.sbatch      Part 1 job: train on the 5070
@@ -39,6 +40,8 @@ docker-cluster/            Part 2: Dockerfile, compose file, slurm.conf, entrypo
 - **For Part 2:** Docker Engine with the compose plugin (`docker compose version`), and your user
   in the `docker` group.
 
+- **[uv](https://docs.astral.sh/uv/)** for the Python environment (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
 You do **not** need the CUDA toolkit. The PyTorch wheel brings its own CUDA runtime.
 
 ---
@@ -48,7 +51,7 @@ You do **not** need the CUDA toolkit. The PyTorch wheel brings its own CUDA runt
 ```bash
 tar xzf slurm-lab.tar.gz && cd slurm-lab
 sudo ./setup-host-slurm.sh      # installs Slurm, writes /etc/slurm/{slurm,gres}.conf, runs a GPU test job
-./setup-python.sh               # as your normal user: venv + PyTorch (cu128) + GPU checks
+./setup-python.sh               # as your normal user: uv sync (.venv + PyTorch cu128) + GPU checks
 sbatch jobs/gpu-1node.sbatch    # submit training
 ```
 
@@ -170,7 +173,11 @@ This cluster is separate from the Slurm in Part 1. Its ports aren't published, s
    mode `400`), then restart `munge`.
 3. **Same users with the same UIDs** on every machine.
 4. **A shared filesystem.** Export the lab folder over NFS and mount it at the same path everywhere,
-   so the venv, code, logs and checkpoints are identical on all nodes.
+   so the code, logs and checkpoints are identical on all nodes. For Python, either share `.venv` too
+   (its interpreter is a uv-managed Python under `~/.local/share/uv/python`, so install the same one on
+   every node with `uv python install 3.12`), or run `uv sync --frozen` on each node. `uv.lock` pins the
+   exact torch build, so every node gets identical packages either way. In job scripts call
+   `.venv/bin/torchrun` directly rather than `uv run`, so the nodes don't all try to sync the same `.venv` at once.
 5. **Network.** Hostnames resolve on every node (`/etc/hosts` is fine). Open ports 6817–6819 for
    Slurm, plus the torchrun/NCCL ports. On a LAN, the simplest option is to allow all traffic
    between the nodes. If NCCL picks the wrong NIC, set `NCCL_SOCKET_IFNAME`.
@@ -190,7 +197,7 @@ AWS ParallelCluster/PCS, or Google Cluster Toolkit.
 | `sinfo` shows the node `drain` or `down` | `sinfo -R` shows the reason. Usually a memory or CPU mismatch: lower `RealMemory` in `/etc/slurm/slurm.conf`, `sudo systemctl restart slurmctld slurmd`, then `sudo scontrol update nodename=$(hostname -s) state=resume` |
 | Services won't start | `sudo journalctl -u slurmctld -u slurmd -n 50`, `/var/log/slurm/*.log`, or run in the foreground: `sudo systemctl stop slurmd && sudo slurmd -Dvvv` |
 | `Invalid generic resource (gres) specification` | `GresTypes=gpu` missing, or `gres.conf` doesn't match the node name. Re-run `sudo ./setup-host-slurm.sh` |
-| `no kernel image is available for execution on the device` | Your torch build doesn't include sm_120. Re-run `./setup-python.sh` (it uses the cu128 index), or set `TORCH_INDEX` to a newer one from pytorch.org |
+| `no kernel image is available for execution on the device` | Your torch build doesn't include sm_120. Re-run `./setup-python.sh` (it uses the cu128 index), or change the index URL in `pyproject.toml` to a newer one from pytorch.org and run `uv lock && uv sync` |
 | Job stuck in `PD` with `Resources` | Something else holds the GPU. `squeue` to see what. |
 | Job stuck in `PD` with `ReqNodeNotAvail` | Node is drained. See the first row. |
 | Docker: `c1`/`c2` show `down*` | `docker compose logs c1`. If slurmd complains about cgroups, add `privileged: true` and `cgroup: host` under `x-node` in `docker-compose.yml`, then `docker compose up -d` |
