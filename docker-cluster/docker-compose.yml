@@ -1,0 +1,28 @@
+# Run from this folder:  docker compose up -d --build
+# The whole slurm-lab folder is mounted at /lab on every node, playing the role of the
+# shared filesystem (NFS) that real clusters have.
+x-node: &node
+  build: .
+  image: slurm-lab:latest
+  volumes:
+    - ..:/lab
+  shm_size: 1g
+  restart: unless-stopped
+
+services:
+  slurmctld:
+    <<: *node
+    hostname: slurmctld
+    command: ["slurmctld"]
+
+  c1:
+    <<: *node
+    hostname: c1
+    command: ["slurmd"]
+    depends_on: [slurmctld]
+
+  c2:
+    <<: *node
+    hostname: c2
+    command: ["slurmd"]
+    depends_on: [slurmctld]
