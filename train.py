@@ -21,8 +21,8 @@ import time
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
@@ -72,7 +72,7 @@ def main():
     args = parse_args()
 
     use_cuda = torch.cuda.is_available() and not args.cpu
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if use_cuda:
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
