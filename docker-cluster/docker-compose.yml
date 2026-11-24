@@ -1,26 +1,32 @@
 # Run from this folder:  docker compose up -d --build
 # The whole slurm-lab folder is mounted at /lab on every node, playing the role of the
 # shared filesystem (NFS) that real clusters have.
+
+# Settings shared by every node. "x-" keys are ignored by Compose, so this is just a YAML
+# anchor (&node) that each service pulls in with "<<: *node".
 x-node: &node
-  build: .
-  image: slurm-lab:latest
+  build: .                     # build from ./Dockerfile (same image for controller and nodes)
+  image: slurm-lab:latest      # tag for the built image, so all three services reuse one build
   volumes:
-    - ..:/lab
-  shm_size: 1g
-  restart: unless-stopped
+    - ..:/lab                  # repo root -> /lab in every container (the "NFS"); logs/checkpoints land on the host
+  shm_size: 1g                 # /dev/shm size; Docker's 64 MB default is too small for torch workers
+  restart: unless-stopped      # come back after a crash or Docker restart, until you `docker compose down`
 
 services:
+  # Controller (head node): runs the scheduler; you sbatch/squeue from here.
   slurmctld:
-    <<: *node
-    hostname: slurmctld
-    command: ["slurmctld"]
+    <<: *node                  # merge in the shared settings above
+    hostname: slurmctld        # must match SlurmctldHost= in slurm.conf
+    command: ["slurmctld"]     # argument to entrypoint.sh: start munge, then the controller
 
+  # Compute node 1.
   c1:
     <<: *node
-    hostname: c1
-    command: ["slurmd"]
-    depends_on: [slurmctld]
+    hostname: c1               # must match NodeName=c[1-2] in slurm.conf
+    command: ["slurmd"]        # entrypoint.sh: start munge, wait for the controller, then slurmd
+    depends_on: [slurmctld]    # start after the controller container (entrypoint.sh still waits for it to be UP)
 
+  # Compute node 2. To add c3: copy this block and extend NodeName/PartitionName in slurm.conf.
   c2:
     <<: *node
     hostname: c2
