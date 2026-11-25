@@ -1,0 +1,24 @@
+# Apptainer definition file: the HPC-center way to build the same environment as containers/Dockerfile
+# without Docker (PRACTICE.md Module 9.4). Build from the repo root:
+#   apptainer build images/train-def.sif containers/train.def
+Bootstrap: docker
+From: pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+
+%post
+    # Runs once at build time, inside the image. Same extra deps as the Dockerfile.
+    pip install --no-cache-dir "numpy>=2.5.5"
+
+%environment
+    # Set every time the container starts.
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    # What `apptainer run images/train-def.sif <args>` does.
+    exec /usr/local/bin/torchrun "$@"
+
+%test
+    # Runs at the end of the build; a failure here fails the build.
+    python -c "import torch; assert torch.version.cuda.startswith('12.8'); print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+%labels
+    Description slurm-lab training image (torch 2.11.0 + CUDA 12.8)

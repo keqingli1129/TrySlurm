@@ -1,0 +1,51 @@
+# 2 pods x 2 workers DDP on CPU: the k8s version of jobs/multinode-cpu.sbatch (PRACTICE.md Module 10).
+#   kubectl apply -f k8s/ddp-cpu-2pod.yaml && kubectl logs -f ddp-cpu-0-<suffix>
+# Each pod plays one "node". Kubernetes has no srun, so this file does srun's jobs by hand:
+# start N copies (Indexed Job), number them (JOB_COMPLETION_INDEX), and give the first a stable
+# DNS name for the rendezvous (headless Service).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ddp                          # pods get DNS names <pod hostname>.ddp
+spec:
+  clusterIP: None                    # "headless": no load balancer, just per-pod DNS records
+  publishNotReadyAddresses: true     # publish DNS as soon as a pod has an IP
+  selector:
+    job-name: ddp-cpu                # label the Job controller puts on its pods
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ddp-cpu
+spec:
+  completionMode: Indexed            # pods get index 0..completions-1 and hostname ddp-cpu-<index>
+  completions: 2                     # like --nodes=2
+  parallelism: 2                     # start both at once; DDP needs all ranks running together
+  backoffLimit: 0                    # one failed pod fails the job (a dead rank kills DDP anyway)
+  template:
+    spec:
+      subdomain: ddp                 # must match the Service name, so ddp-cpu-0.ddp resolves
+      restartPolicy: Never
+      containers:
+        - name: train
+          image: slurm-lab-train:v1
+          imagePullPolicy: Never
+          env:
+            - name: GLOO_SOCKET_IFNAME
+              value: eth0            # the pod's network interface
+            - name: OMP_NUM_THREADS
+              value: "1"             # 2 CPUs per pod / 2 workers
+          # Static rendezvous (PRACTICE.md 1.3): node_rank comes from the pod index, and pod 0
+          # hosts the store. bash -c so $JOB_COMPLETION_INDEX is expanded inside each pod.
+          command: ["bash", "-c"]
+          args:
+            - >-
+              exec torchrun --nnodes=2 --node_rank=$JOB_COMPLETION_INDEX --nproc_per_node=2
+              --master_addr=ddp-cpu-0.ddp --master_port=29500
+              train.py --cpu --epochs 3 --samples 60000 --hidden 512 --batch-size 256
+              --ckpt /tmp/ddp-cpu.pt
+          resources:
+            requests:
+              cpu: "2"               # like --cpus-per-task=2
+            limits:
+              memory: 2Gi

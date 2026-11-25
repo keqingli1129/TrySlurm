@@ -1,0 +1,32 @@
+# Single-GPU training as a Kubernetes Job: the k8s version of jobs/gpu-1node.sbatch (PRACTICE.md Module 10).
+#   kubectl apply -f k8s/gpu-job.yaml && kubectl logs -f job/ddp-gpu
+apiVersion: batch/v1
+kind: Job                            # run pods to completion (like sbatch), not forever (like a Deployment)
+metadata:
+  name: ddp-gpu
+spec:
+  backoffLimit: 2                    # retry a failed pod up to 2 times (Slurm's --requeue, roughly)
+  template:
+    spec:
+      restartPolicy: Never           # on failure make a new pod instead of restarting in place
+      containers:
+        - name: train
+          image: slurm-lab-train:v1  # built from containers/Dockerfile, imported into k3s
+          imagePullPolicy: Never     # only use the imported copy; there is no registry to pull from
+          # --standalone: single-node rendezvous on localhost, no endpoint needed.
+          command: ["torchrun", "--standalone", "--nproc_per_node=1",
+                    "train.py", "--epochs", "10", "--ckpt", "/ckpt/ddp-gpu.pt"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1      # the k8s --gpus-per-node; counted by the NVIDIA device plugin
+              memory: 8Gi            # unlike this lab's Slurm, k8s enforces limits (cgroups)
+            requests:
+              cpu: "4"               # like --cpus-per-task: the scheduler reserves it
+          volumeMounts:
+            - name: ckpt
+              mountPath: /ckpt
+      volumes:
+        - name: ckpt                 # no shared filesystem here, so keep checkpoints on the host
+          hostPath:                  # disk; a real cluster would use a PersistentVolumeClaim
+            path: /tmp/k8s-ckpt
+            type: DirectoryOrCreate

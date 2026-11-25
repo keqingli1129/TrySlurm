@@ -1,0 +1,5 @@
+# Build context for containers/Dockerfile (repo root). Keep it to the few files the image copies;
+# without this, docker would upload .venv (several GB) on every build.
+*
+!train.py
+!check_gpu.py

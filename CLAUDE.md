@@ -11,6 +11,8 @@ Three "parts" share the same `train.py`:
 2. **Docker cluster** (`docker-cluster/`): a controller and nodes `c1`, `c2`, all built from one image (Ubuntu 24.04, Slurm, CPU-only torch in `/opt/venv`). The munge key is baked into the image, so all nodes share it. `slurm.conf` hardcodes `CPUs=4 RealMemory=2000` with `SlurmdParameters=config_overrides`. To add a node, edit both `docker-compose.yml` and `NodeName=`/`PartitionName=` in `slurm.conf`.
 3. **Multi-node GPU** template (`jobs/multinode-gpu.sbatch`) for when a second GPU machine exists.
 
+Containers (PRACTICE.md Modules 8–10) reuse one image, `slurm-lab-train:v1` from `containers/Dockerfile` (build context = repo root, trimmed by `.dockerignore`). Its base `pytorch/pytorch:<ver>-cuda12.8-...` tag must match the torch version in `uv.lock`, and torchrun lives at `/usr/local/bin/torchrun` in it. The image is converted to `images/train.sqsh` (Enroot/Pyxis, `jobs/gpu-1node-pyxis.sbatch`) and `images/train.sif` (Apptainer, `jobs/gpu-1node-apptainer.sbatch`); `images/` is git-ignored. Slurm container jobs bind-mount the repo at `/lab` and run `/lab/train.py`, while `k8s/*.yaml` run the copy baked into `/app` because k3s has no shared filesystem.
+
 ## Commands
 
 ```bash

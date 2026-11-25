@@ -16,6 +16,9 @@ Modules:
 | 5 | Launching ranks with srun instead of torchrun | Docker |
 | 6 | Failure drills | Docker + host |
 | 7 | Moving to real multi-node GPUs | planning |
+| 8 | Containers on Slurm: Enroot + Pyxis | host Slurm |
+| 9 | Containers on Slurm: Apptainer | host Slurm |
+| 10 | Containers without Slurm: Kubernetes (k3s) | host |
 | — | Self-check questions and a cheat sheet | — |
 
 Keep one picture in mind the whole time. Learning multi-node training mostly means getting it to
@@ -504,6 +507,452 @@ in the NCCL log and two hostnames in the rank lines.
 
 ---
 
+## Modules 8–10: running jobs in containers
+
+So far every GPU job ran `.venv/bin/torchrun` from the shared folder, and Module 7 kept every node
+identical with `uv.lock`. Production GPU clusters usually go further and run every job inside a
+**container image**. The image holds the whole user-space stack (OS libraries, CUDA runtime,
+cuDNN, NCCL, Python, torch), so every node runs the same bits no matter what is installed on it.
+
+```
+┌──────────── container image (same on every node) ─────────────┐
+│ torch 2.11.0, NCCL, cuDNN, CUDA 12.8 runtime, Python 3.12     │
+└───────────────────────────────────────────────────────────────┘
+          ▲ libcuda.so + /dev/nvidia* injected when the container starts
+┌──────────── host (each node) ─────────────────────────────────┐
+│ NVIDIA kernel driver, slurmd, munge, network drivers          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+The driver is a kernel module, so it **can't** live in the image. A hook mounts the host's driver
+into the container at start. Rule: the host driver must be new enough for the CUDA version in the
+image (your 615 driver runs CUDA 12.8 images fine).
+
+All three modules use **one image**, built once from `containers/Dockerfile`. It starts from
+`pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`, the same torch that `uv.lock` pins. You will
+run that image with three different tool sets:
+
+| Module | Tool set | Who uses it | How a job starts |
+|---|---|---|---|
+| 8 | Enroot + Pyxis | NVIDIA DGX/SuperPOD, many AI labs | `srun --container-image=...` (Slurm plugin) |
+| 9 | Apptainer | university and national HPC centers | `srun apptainer exec --nv image.sif ...` |
+| 10 | Kubernetes | cloud and ML-platform teams | `kubectl apply -f job.yaml` (no Slurm) |
+
+Files used: `containers/Dockerfile`, `containers/train.def`, `jobs/gpu-1node-pyxis.sbatch`,
+`jobs/gpu-1node-apptainer.sbatch`, `k8s/gpu-job.yaml`, `k8s/ddp-cpu-2pod.yaml`. Images go in
+`images/` (git-ignored). On a real cluster that folder would be on the shared filesystem, so
+every node reads the same image file.
+
+Disk: about 15 GB across the three modules (the base image is 4.3 GB compressed).
+
+---
+
+## Module 8: Containers on Slurm with Enroot + Pyxis
+
+**Enroot** is NVIDIA's container runtime. It turns a Docker image into a plain directory and runs
+it as *your* user, without a root daemon. **Pyxis** is a Slurm plugin (SPANK) that adds
+`--container-*` options to `srun`, so Slurm starts each task inside an Enroot container.
+
+### 8.1 One-time host prep (also needed by Modules 9 and 10)
+
+**a) NVIDIA Container Toolkit.** It's the hook that injects the driver into containers. Its apt
+repo is already configured on this machine, but the package isn't installed:
+
+```bash
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+nvidia-ctk --version
+docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L     # a plain Ubuntu image sees the 5070
+```
+
+The last line is the whole idea in one command: `ubuntu:24.04` has no NVIDIA software in it, but
+`nvidia-smi` works, because the toolkit mounted the host's driver in.
+
+**b) Let unprivileged containers use user namespaces.** Ubuntu 24.04 blocks this by default
+through AppArmor, and Enroot (and Apptainer's unprivileged builds) need it:
+
+```bash
+sysctl kernel.apparmor_restrict_unprivileged_userns      # 1 = restricted (Ubuntu 24.04 default)
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-lab-userns.conf
+sudo sysctl --system
+```
+
+This loosens a hardening setting, which is fine for a lab box. Module 10's clean-up section
+shows how to undo it. HPC sites handle this with an AppArmor profile per tool or a
+setuid install instead.
+
+**c) Build the lab image** (from the repo root; the first build downloads about 4.3 GB):
+
+```bash
+cd ~/Documents/TrySlurm
+docker build -t slurm-lab-train:v1 -f containers/Dockerfile .
+docker run --rm --gpus all -v "$PWD":/lab -w /lab slurm-lab-train:v1 python check_gpu.py
+mkdir -p images logs checkpoints
+```
+
+Look for `sm_120` and `bf16 matmul OK`, as in Module 0, but this time from inside the container.
+Read `containers/Dockerfile` while it builds: it has just a base image, one `pip install`, and a
+copy of `train.py` for Kubernetes.
+
+### 8.2 Install Enroot
+
+```bash
+cd /tmp
+arch=$(dpkg --print-architecture)
+ver=4.2.1                     # latest release: https://github.com/NVIDIA/enroot/releases
+curl -fSsL -O "https://github.com/NVIDIA/enroot/releases/download/v$ver/enroot_${ver}-1_${arch}.deb"
+curl -fSsL -O "https://github.com/NVIDIA/enroot/releases/download/v$ver/enroot+caps_${ver}-1_${arch}.deb"
+sudo apt install -y ./enroot_${ver}-1_${arch}.deb ./enroot+caps_${ver}-1_${arch}.deb
+enroot version
+cd ~/Documents/TrySlurm
+```
+
+`enroot+caps` gives the image-import helpers the file capabilities they need, so you never run
+Enroot as root.
+
+### 8.3 Turn the Docker image into one file
+
+```bash
+enroot import -o images/train.sqsh dockerd://slurm-lab-train:v1
+ls -lh images/
+```
+
+`dockerd://` reads from your local Docker. Without it, Enroot pulls from a registry, e.g.
+`enroot import docker://pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`. The result is a single
+compressed **squashfs** file. That's the format sites keep on shared storage. Copying one file is
+far cheaper than having 500 nodes each pull 4 GB from a registry at the same time.
+
+### 8.4 Run it by hand (no Slurm yet)
+
+```bash
+enroot create --name train images/train.sqsh        # unpack to ~/.local/share/enroot/train
+enroot list
+enroot start --mount "$PWD":/lab train bash -c \
+  'whoami; cat /etc/os-release | head -2; nvidia-smi -L; python /lab/check_gpu.py'
+enroot remove -f train
+```
+
+Things to notice:
+- `whoami` prints **your user**, not root. No daemon, no privilege. That's why HPC admins accept it.
+- `/etc/os-release` shows the *image's* Ubuntu, not your 24.04. The GPU still works, through the
+  hook from 8.1a.
+
+### 8.5 Install Pyxis (the Slurm plugin)
+
+Pyxis must be compiled against the **exact** Slurm version that runs it (23.11.4 here), so build
+it from source against the distro's Slurm headers:
+
+```bash
+sudo apt install -y libslurm-dev build-essential git      # libslurm-dev provides slurm/spank.h
+git clone --depth 1 --branch v0.24.0 https://github.com/NVIDIA/pyxis.git ~/src/pyxis
+cd ~/src/pyxis && make && sudo make install && cd ~/Documents/TrySlurm
+
+# Tell Slurm to load SPANK plugins from plugstack.conf.d/, then register Pyxis there
+echo 'include /etc/slurm/plugstack.conf.d/*' | sudo tee /etc/slurm/plugstack.conf
+sudo ln -sf /usr/local/share/pyxis/pyxis.conf /etc/slurm/plugstack.conf.d/pyxis.conf
+sudo systemctl restart slurmctld slurmd
+
+srun --help | grep -A1 container-image     # new [pyxis] options in srun itself
+```
+
+If `srun` prints `Incompatible plugin version`, Pyxis was built against different Slurm headers
+than the running Slurm. Check `dpkg -l libslurm-dev slurm-wlm` show the same version.
+
+### 8.6 First containerized srun
+
+```bash
+srun --gpus=1 --container-image="$PWD/images/train.sqsh" \
+     --container-mounts="$PWD":/lab --container-workdir=/lab \
+     python check_gpu.py
+
+srun --container-image="$PWD/images/train.sqsh" python -c 'import torch; print(torch.__version__)'
+.venv/bin/python -c 'import torch; print(torch.__version__)'
+```
+
+Both print torch 2.11.0. One comes from the image and one from `.venv`, which proves the image
+matches what you've been using. Each `srun` unpacks the image again, so the first run takes a few
+seconds longer.
+
+### 8.7 The batch job
+
+```bash
+diff jobs/gpu-1node.sbatch jobs/gpu-1node-pyxis.sbatch
+sbatch jobs/gpu-1node-pyxis.sbatch
+tail -f logs/ddp-pyxis-<jobid>.out
+ls -l checkpoints/ddp-pyxis.pt
+```
+
+The diff shows the point of this module: the `#SBATCH` lines, rendezvous and `train.py`
+arguments are unchanged. Only the srun line gained three `--container-*` options and points at
+the image's `torchrun`. Check:
+- `backend=nccl` with the 5070, the same as Module 3.
+- `checkpoints/ddp-pyxis.pt` is owned by **you**, because the container ran as your UID.
+- The image provides the libraries, and the bind-mounted repo provides the code, logs and
+  checkpoints. Edit `train.py` and resubmit: no rebuild needed.
+
+### 8.8 Try it
+
+- **Pull from a registry instead of a file:** `IMAGE=pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime sbatch --job-name=pyxis-pull jobs/gpu-1node-pyxis.sbatch --epochs 2`.
+  It works because `train.py` needs only torch. The download goes into `~/.cache/enroot` and
+  takes minutes. Picture 100 nodes doing that at once, and you have the reason sites pre-stage `.sqsh` files.
+- **Keep the container between steps:** add `--container-name=train` to two `srun` lines in the
+  same job. The second one reuses the unpacked container instead of unpacking again.
+- **Requeue still works:** repeat Module 3.3 with `jobs/gpu-1node-pyxis.sbatch`. The checkpoint
+  is on the bind mount, so the new container resumes it.
+
+### 8.9 What multi-node adds
+
+Nothing new in the script: set `--nodes=2` and keep `images/train.sqsh` on NFS. Pyxis containers
+share the **host's network**, so NCCL sees the real NICs and `NCCL_SOCKET_IFNAME` works the same
+as in Module 7.3. For InfiniBand, the image must also contain the RDMA user-space libraries.
+NVIDIA's NGC images (`nvcr.io#nvidia/pytorch:<yy.mm>-py3`) include them, which is why they are
+the usual choice on GPU clusters.
+
+---
+
+## Module 9: Containers on Slurm with Apptainer
+
+**Apptainer** (formerly Singularity) is the HPC-center standard. An image is a single read-only
+`.sif` file, and a container runs as your user with your home folder mounted. It isn't a Slurm
+plugin. `srun` simply runs the `apptainer` command, so it works on any cluster where it's installed.
+
+### 9.1 Install
+
+Needs 8.1a and 8.1b done first.
+
+```bash
+sudo add-apt-repository -y ppa:apptainer/ppa
+sudo apt update && sudo apt install -y apptainer
+apptainer --version
+```
+
+### 9.2 Convert the same Docker image to a .sif
+
+```bash
+apptainer build images/train.sif docker-daemon://slurm-lab-train:v1
+ls -lh images/
+```
+
+Now you have one environment in two formats: `train.sqsh` for Enroot and `train.sif` for Apptainer.
+
+### 9.3 Run it by hand
+
+```bash
+apptainer exec images/train.sif nvidia-smi -L            # fails: no GPU without --nv
+apptainer exec --nv images/train.sif nvidia-smi -L       # works
+apptainer exec --nv images/train.sif python check_gpu.py # no --bind, yet check_gpu.py is found
+apptainer exec images/train.sif bash -c 'whoami; pwd; touch /usr/x'
+```
+
+Things to notice:
+- `--nv` is Apptainer's version of the 8.1a hook. It binds the host's NVIDIA libraries in.
+- `check_gpu.py` was found without a `--bind`, because Apptainer mounts `$HOME` and the current
+  folder by default. Docker isolates by default, while Apptainer integrates by default. That's
+  why HPC users like it.
+- `touch /usr/x` fails with a read-only file system. The image can't drift between runs.
+
+### 9.4 Build from a definition file (the HPC way)
+
+HPC centers often don't have Docker at all. They build from a `.def` recipe instead. Read
+`containers/train.def`, then:
+
+```bash
+apptainer build images/train-def.sif containers/train.def   # pulls the base from Docker Hub (~4 GB)
+apptainer inspect --deffile images/train-def.sif             # the recipe is stored in the image
+apptainer run --nv images/train-def.sif --standalone --nproc_per_node=1 \
+  train.py --epochs 1 --ckpt /tmp/def.pt                     # %runscript = torchrun
+```
+
+The `%test` section runs at the end of the build, and the build fails if torch isn't a CUDA 12.8
+build. If the build errors about fakeroot or permissions, use `sudo apptainer build ...`.
+
+### 9.5 The batch job
+
+```bash
+diff jobs/gpu-1node.sbatch jobs/gpu-1node-apptainer.sbatch
+sbatch jobs/gpu-1node-apptainer.sbatch
+tail -f logs/ddp-apptainer-<jobid>.out
+```
+
+Same check as 8.7: `backend=nccl`, and the checkpoint is owned by you.
+
+### 9.6 Pyxis or Apptainer?
+
+| | Enroot + Pyxis | Apptainer |
+|---|---|---|
+| Image file | `.sqsh` (or pull at job start) | `.sif` |
+| Slurm integration | plugin: `srun --container-image` | none needed: `srun apptainer exec` |
+| GPU | automatic (image's `NVIDIA_VISIBLE_DEVICES`) | `--nv` flag |
+| Default mounts | nothing; you list `--container-mounts` | `$HOME`, cwd, `/tmp` |
+| Writable image | yes (`--container-writable`) | no (read-only) |
+| Builds images | no, imports Docker images | yes, from `.def` files |
+| Typical home | NVIDIA DGX / AI clusters | university / national HPC |
+
+Both run as your user, with no daemon. That's the property that makes containers acceptable on
+a shared Slurm cluster, and the reason plain Docker isn't used there.
+
+---
+
+## Module 10: Containers without Slurm: Kubernetes (k3s)
+
+Cloud and platform teams often skip Slurm and run training on **Kubernetes**. The same image
+runs, but the scheduler, the launch and the storage all work differently. **k3s** is a
+single-binary Kubernetes that fits on one machine.
+
+> The GPU is not shared between Slurm and Kubernetes. Neither knows about the other, so don't run
+> Slurm GPU jobs while a k8s GPU job is running.
+
+### 10.1 Map what you know
+
+| Slurm | Kubernetes |
+|---|---|
+| `sbatch job.sbatch` | `kubectl apply -f job.yaml` (a `Job`) |
+| `squeue` / `scontrol show job` | `kubectl get pods` / `kubectl describe pod` |
+| `tail -f logs/...out` | `kubectl logs -f ...` |
+| `--gpus-per-node=1` | `resources.limits: nvidia.com/gpu: 1` |
+| GRES + `gres.conf` | NVIDIA device plugin (a DaemonSet) |
+| `--nodes=2` + `srun` | Indexed Job, `completions: 2` |
+| `SLURM_NODEID` | `JOB_COMPLETION_INDEX` |
+| first host of `SLURM_JOB_NODELIST` | stable DNS name from a headless Service |
+| shared NFS folder | PersistentVolumeClaim (here: a `hostPath`) |
+| `--requeue` | `backoffLimit` / Job re-creates the pod |
+
+### 10.2 Install k3s with the NVIDIA runtime
+
+Needs 8.1a done first. k3s finds `nvidia-container-runtime` at startup, and
+`--default-runtime=nvidia` makes every pod use it:
+
+```bash
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--default-runtime=nvidia --write-kubeconfig-mode=644" sh -
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml        # add to ~/.bashrc while you use this module
+kubectl get nodes                                   # one node, Ready
+sudo grep -c nvidia /var/lib/rancher/k3s/agent/etc/containerd/config.toml   # > 0
+```
+
+If the grep prints `0`, the toolkit was installed after k3s. Run `sudo systemctl restart k3s`.
+
+### 10.3 Teach Kubernetes about the GPU
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.20.2/deployments/static/nvidia-device-plugin.yml
+kubectl -n kube-system get pods -l name=nvidia-device-plugin-ds    # Running
+kubectl describe node | grep -A7 Allocatable                       # nvidia.com/gpu: 1
+```
+
+This is the Kubernetes counterpart of `GresTypes=gpu` + `gres.conf`. Until the device plugin
+reports `nvidia.com/gpu: 1`, no pod requesting a GPU can be scheduled.
+
+### 10.4 Load the image into k3s
+
+k3s has its own containerd and doesn't see Docker's images. There's no registry in this lab, so
+copy the image in:
+
+```bash
+docker save slurm-lab-train:v1 | sudo k3s ctr images import -
+sudo k3s crictl images | grep slurm-lab
+```
+
+A real cluster pushes to a registry instead, and every node pulls from it.
+
+### 10.5 Single-GPU training Job
+
+Read `k8s/gpu-job.yaml`, then:
+
+```bash
+kubectl apply -f k8s/gpu-job.yaml
+kubectl get pods -w                       # ContainerCreating → Running → Completed (Ctrl-C)
+kubectl logs -f job/ddp-gpu
+```
+
+Look for `backend=nccl`. Note what's different from Slurm:
+- The code is **in the image** (`/app/train.py`). No shared folder is mounted, so changing
+  `train.py` means rebuilding and re-importing the image.
+- `--standalone` replaces the rendezvous endpoint because there's only one node.
+- The memory **limit** is enforced. Kubernetes always uses cgroups, unlike this lab's Slurm (Module 2.2).
+
+**Requeue, Kubernetes style.** Delete the checkpoint, start again, and kill the pod mid-run:
+
+```bash
+kubectl delete job ddp-gpu; sudo rm -f /tmp/k8s-ckpt/ddp-gpu.pt
+kubectl apply -f k8s/gpu-job.yaml
+# once epochs are printing:
+kubectl delete pod -l job-name=ddp-gpu
+kubectl get pods -w                       # the Job controller creates a replacement pod
+kubectl logs -f job/ddp-gpu               # "Resumed from /ckpt/ddp-gpu.pt ..."
+```
+
+**Pending, Kubernetes style.** Submit a second GPU job while the first runs:
+
+```bash
+sed 's/name: ddp-gpu$/name: ddp-gpu2/' k8s/gpu-job.yaml | kubectl apply -f -
+kubectl get pods                          # ddp-gpu2-... is Pending
+kubectl describe pod -l job-name=ddp-gpu2 | tail -3   # "Insufficient nvidia.com/gpu" = PD (Resources)
+kubectl delete job ddp-gpu2
+```
+
+### 10.6 Two "nodes": DDP across two pods
+
+Kubernetes has no `srun`, so `k8s/ddp-cpu-2pod.yaml` does srun's jobs by hand. It starts two
+numbered pods (an Indexed Job) and gives pod 0 a DNS name (`ddp-cpu-0.ddp`) for the master
+address. Read it, then:
+
+```bash
+kubectl apply -f k8s/ddp-cpu-2pod.yaml
+kubectl get pods -o wide -l job-name=ddp-cpu
+kubectl logs -f -l job-name=ddp-cpu --prefix --max-log-requests 2
+```
+
+Check:
+- 4 `[rank r/4]` lines, two with `host=ddp-cpu-0` and two with `host=ddp-cpu-1`. That's the
+  same layout as Module 4.3, with pods in place of `c1`/`c2`.
+- It uses **static** rendezvous (Module 1.3): `--node_rank=$JOB_COMPLETION_INDEX`. In Slurm,
+  c10d plus `srun` handled the numbering for you.
+- Pod 1 may log a few `cannot be retrieved (gai error...)` warnings at first. Pod 0's DNS record
+  didn't exist yet, and torchrun retries until it does.
+
+Clean up: `kubectl delete -f k8s/ddp-cpu-2pod.yaml`.
+
+**Try it: a GPU leak.** Run a pod that does *not* request a GPU:
+
+```bash
+kubectl run gpu-peek --rm -it --restart=Never --image=slurm-lab-train:v1 \
+  --image-pull-policy=Never -- nvidia-smi -L
+```
+
+It will most likely list the 5070. The image sets `NVIDIA_VISIBLE_DEVICES=all`, and with
+`--default-runtime=nvidia` the runtime honours it even when no GPU was requested. This is
+Module 2.2's "scheduled, not enforced" lesson again. Production clusters close the gap with the
+NVIDIA GPU Operator and the device plugin's `volume-mounts`/CDI device-list strategies.
+
+### 10.7 What production adds on top
+
+You did the launch wiring by hand on purpose, the same reason Module 5 skipped torchrun.
+Real teams use:
+- **Kubeflow Trainer** (`TrainJob`, earlier `PyTorchJob`): you give it the image and the replica
+  count, and it creates the pods and Service and sets `MASTER_ADDR`/`RANK`/`WORLD_SIZE` for you.
+- **Kueue or Volcano** for **gang scheduling**: start all pods of a job or none. Slurm does this
+  by default. Plain Kubernetes doesn't, so a 2-pod job can end up half-running on a busy cluster
+  while it waits forever for its other half.
+- **NVIDIA GPU Operator**: installs the driver hook, the device plugin and monitoring on every GPU node.
+- **PersistentVolumeClaims** on shared storage for checkpoints and datasets, instead of `hostPath`.
+
+### 10.8 Clean up everything from Modules 8–10
+
+```bash
+kubectl delete -f k8s/ --ignore-not-found
+/usr/local/bin/k3s-uninstall.sh                                  # removes k3s completely
+sudo rm -rf /tmp/k8s-ckpt
+rm -rf images/ ~/.cache/enroot ~/.local/share/enroot             # image files and Enroot caches
+rm -f checkpoints/ddp-pyxis.pt checkpoints/ddp-apptainer.pt checkpoints/pyxis-pull.pt
+docker image rm slurm-lab-train:v1
+# optional: restore Ubuntu's user-namespace restriction from 8.1b
+sudo rm /etc/sysctl.d/60-lab-userns.conf && sudo sysctl kernel.apparmor_restrict_unprivileged_userns=1
+```
+
+Pyxis can stay installed. It only acts when you pass `--container-*`. To remove it:
+`sudo rm /etc/slurm/plugstack.conf.d/pyxis.conf && sudo systemctl restart slurmd slurmctld`.
+
+---
+
 ## Self-check questions
 
 Answer these from memory. If you can't, redo the module in brackets.
@@ -518,6 +967,9 @@ Answer these from memory. If you can't, redo the module in brackets.
 8. Your 2-node GPU job is slower than 1 node. What do you check first? [4.4, 7.3]
 9. How would you convert `multinode-gpu.sbatch` to srun-per-rank launching? [5]
 10. What does Slurm *not* enforce in this lab's config, and what would a production cluster use? (README: `proctrack/cgroup`, `task/cgroup`, `ConstrainDevices=yes`) [2.2]
+11. Which part of the GPU stack can't go in a container image, and what rule links it to the image's CUDA version? [8.1]
+12. Why do Slurm sites use Enroot/Pyxis or Apptainer instead of Docker? Why do they keep images as `.sqsh`/`.sif` files on shared storage? [8.3, 9.6]
+13. In the Kubernetes 2-pod job, what replaced `srun`, `SLURM_NODEID` and the "first host of the node list"? What does Slurm give you that plain Kubernetes doesn't? [10.6, 10.7]
 
 ## Cheat sheet
 
@@ -537,4 +989,13 @@ scontrol update nodename=<n> state=drain reason="..." | state=resume
 # Slurm → PyTorch variables
 SLURM_PROCID→RANK  SLURM_LOCALID→LOCAL_RANK  SLURM_NTASKS→WORLD_SIZE  SLURM_NODEID→node rank
 first host of $(scontrol show hostnames "$SLURM_JOB_NODELIST") → MASTER_ADDR / rdzv host
+
+# Containers (Modules 8–10)
+docker build -t slurm-lab-train:v1 -f containers/Dockerfile .
+enroot import -o images/train.sqsh dockerd://slurm-lab-train:v1
+srun --gpus=1 --container-image=$PWD/images/train.sqsh --container-mounts=$PWD:/lab --container-workdir=/lab <cmd>
+apptainer build images/train.sif docker-daemon://slurm-lab-train:v1
+srun --gpus=1 apptainer exec --nv images/train.sif <cmd>
+docker save slurm-lab-train:v1 | sudo k3s ctr images import -
+kubectl apply -f k8s/gpu-job.yaml | kubectl get pods | kubectl logs -f job/ddp-gpu | kubectl delete -f <file>
 ```

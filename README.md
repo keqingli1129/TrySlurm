@@ -26,6 +26,11 @@ jobs/gpu-1node.sbatch      Part 1 job: train on the 5070
 jobs/multinode-cpu.sbatch  Part 2 job: 2 nodes x 2 workers on the Docker cluster
 jobs/multinode-gpu.sbatch  Part 3 template: N nodes x M GPUs
 docker-cluster/            Part 2: Dockerfile, compose file, slurm.conf, entrypoint
+PRACTICE.md                step-by-step practice guide (Modules 0-10)
+containers/                training image (Dockerfile, Apptainer train.def) for PRACTICE.md Modules 8-10
+jobs/gpu-1node-pyxis.sbatch      Module 8: the Part 1 job inside an Enroot container via Pyxis
+jobs/gpu-1node-apptainer.sbatch  Module 9: the Part 1 job inside an Apptainer image
+k8s/                       Module 10: the same training as Kubernetes Jobs (1 GPU; 2 pods on CPU)
 ```
 
 ---
